@@ -1,0 +1,10 @@
+prefix=${pcfiledir}
+libdir=${prefix}
+includedir=${prefix}
+
+Name: fuse3
+Description: Filesystem in Userspace
+Version: 3.10.5
+Libs: -L${libdir} -lfuse3 -lpthread
+Libs.private: -ldl -pthread -lrt
+Cflags: -I${includedir}

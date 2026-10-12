@@ -1,0 +1,6 @@
+option(
+  'fuse3_root',
+  type: 'string',
+  value: '',
+  description: 'Target FUSE3 root used for cross builds'
+)
