@@ -31,11 +31,19 @@ typedef struct _nodefs_entry_t {
     struct _nodefs_entry_t *parent;
     struct list_head children;
     struct list_head sibling;
+    pthread_mutex_t active_lock;
+    pthread_cond_t idle;
+    unsigned active;
 } nodefs_entry_t;
 
 typedef struct {
-    nodefs_entry_t *entry;
     struct fuse_pollhandle *ph;
+    unsigned refs; /* protected by fs->lock */
+} nodefs_pollref_t;
+
+typedef struct {
+    nodefs_entry_t *entry;
+    nodefs_pollref_t *pollref;
     struct list_head link;
 } nodefs_handle_t;
 
@@ -44,11 +52,130 @@ struct nodefs {
     pthread_rwlock_t lock;
     struct fuse *fuse;
     struct list_head handles;
+    pthread_mutex_t notify_lock;
+    pthread_cond_t notify_idle;
+    unsigned notifying;
+    int retiring;
 };
 
 typedef struct _nodefs_mount_t {
     nodefs_t *fs;
 } nodefs_mount_t;
+
+static _Thread_local unsigned nodefs_callback_depth;
+
+/* Pin while holding fs->lock; unregister detaches first, then drains pins. */
+static void nodefs_entry_pin(nodefs_entry_t *entry)
+{
+    pthread_mutex_lock(&entry->active_lock);
+    entry->active++;
+    pthread_mutex_unlock(&entry->active_lock);
+}
+
+static void nodefs_entry_unpin(nodefs_entry_t *entry)
+{
+    pthread_mutex_lock(&entry->active_lock);
+    if (--entry->active == 0)
+        pthread_cond_broadcast(&entry->idle);
+    pthread_mutex_unlock(&entry->active_lock);
+}
+
+static void nodefs_callback_cleanup(void *arg)
+{
+    nodefs_callback_depth--;
+    nodefs_entry_unpin(arg);
+}
+
+static void nodefs_entry_drain(nodefs_entry_t *entry)
+{
+    pthread_mutex_lock(&entry->active_lock);
+    while (entry->active)
+        pthread_cond_wait(&entry->idle, &entry->active_lock);
+    pthread_mutex_unlock(&entry->active_lock);
+}
+
+/* Caller holds fs->lock exclusively. Snapshot references survive release,
+ * poll-handle replacement and node removal while notification runs unlocked. */
+static void nodefs_pollref_put(nodefs_pollref_t *ref)
+{
+    if (ref != NULL && --ref->refs == 0) {
+        fuse_pollhandle_destroy(ref->ph);
+        free(ref);
+    }
+}
+
+static int nodefs_poll_snapshot(nodefs_t *fs, nodefs_entry_t *entry,
+                                nodefs_pollref_t ***refs, size_t *count)
+{
+    nodefs_handle_t *handle;
+    size_t n = 0;
+    *refs = NULL;
+    *count = 0;
+    list_for_each_entry(handle, &fs->handles, link) {
+        if (handle->entry == entry && handle->pollref != NULL)
+            n++;
+    }
+    if (n == 0)
+        return 0;
+    *refs = calloc(n, sizeof(**refs));
+    if (*refs == NULL)
+        return -ENOMEM;
+    list_for_each_entry(handle, &fs->handles, link) {
+        if (handle->entry == entry && handle->pollref != NULL) {
+            handle->pollref->refs++;
+            (*refs)[(*count)++] = handle->pollref;
+        }
+    }
+    pthread_mutex_lock(&fs->notify_lock);
+    fs->notifying++;
+    pthread_mutex_unlock(&fs->notify_lock);
+    return 0;
+}
+
+typedef struct {
+    nodefs_t *fs;
+    nodefs_pollref_t **refs;
+    size_t count;
+} nodefs_notification_t;
+
+static void nodefs_notification_cleanup(void *arg)
+{
+    nodefs_notification_t *notification = arg;
+    nodefs_t *fs = notification->fs;
+    pthread_rwlock_wrlock(&fs->lock);
+    for (size_t i = 0; i < notification->count; i++)
+        nodefs_pollref_put(notification->refs[i]);
+    pthread_rwlock_unlock(&fs->lock);
+    free(notification->refs);
+    if (notification->count != 0) {
+        pthread_mutex_lock(&fs->notify_lock);
+        if (--fs->notifying == 0)
+            pthread_cond_broadcast(&fs->notify_idle);
+        pthread_mutex_unlock(&fs->notify_lock);
+    }
+}
+
+static int nodefs_poll_send(nodefs_t *fs, nodefs_pollref_t **refs, size_t count)
+{
+    int ret = 0;
+    nodefs_notification_t notification = { fs, refs, count };
+    pthread_cleanup_push(nodefs_notification_cleanup, &notification);
+    for (size_t i = 0; i < count; i++) {
+        int err = fuse_notify_poll(refs[i]->ph);
+        if (err != 0 && ret == 0)
+            ret = err;
+    }
+    pthread_cleanup_pop(1);
+    return ret;
+}
+
+static void nodefs_notifications_drain(nodefs_t *fs)
+{
+    pthread_mutex_lock(&fs->notify_lock);
+    while (fs->notifying)
+        pthread_cond_wait(&fs->notify_idle, &fs->notify_lock);
+    pthread_mutex_unlock(&fs->notify_lock);
+}
 
 static void nodefs_log_error(const char *fmt, ...)
 {
@@ -189,6 +316,18 @@ static nodefs_entry_t* nodefs_entry_create(const char *name, size_t name_len,
     }
 
     entry->type = type;
+    if (pthread_mutex_init(&entry->active_lock, NULL) != 0) {
+        free(entry->name);
+        free(entry);
+        return NULL;
+    }
+    if (pthread_cond_init(&entry->idle, NULL) != 0) {
+        pthread_mutex_destroy(&entry->active_lock);
+        free(entry->name);
+        free(entry);
+        return NULL;
+    }
+    entry->active = 0;
     entry->node = NULL;
     entry->parent = NULL;
     INIT_LIST_HEAD(&entry->children);
@@ -213,6 +352,8 @@ static void nodefs_entry_destroy(nodefs_entry_t *entry)
     }
 
     free(entry->name);
+    pthread_cond_destroy(&entry->idle);
+    pthread_mutex_destroy(&entry->active_lock);
     free(entry);
 }
 
@@ -380,13 +521,24 @@ static nodefs_entry_t* nodefs_insert_path(nodefs_t *fs, const nodefs_node_t *nod
 
 nodefs_t* nodefs_create(void)
 {
-    nodefs_t *fs = malloc(sizeof(*fs));
+    nodefs_t *fs = calloc(1, sizeof(*fs));
 
     if (fs == NULL) {
         return NULL;
     }
 
     if (pthread_rwlock_init(&fs->lock, NULL) != 0) {
+        free(fs);
+        return NULL;
+    }
+    if (pthread_mutex_init(&fs->notify_lock, NULL) != 0) {
+        pthread_rwlock_destroy(&fs->lock);
+        free(fs);
+        return NULL;
+    }
+    if (pthread_cond_init(&fs->notify_idle, NULL) != 0) {
+        pthread_mutex_destroy(&fs->notify_lock);
+        pthread_rwlock_destroy(&fs->lock);
         free(fs);
         return NULL;
     }
@@ -408,8 +560,7 @@ static void nodefs_clear_handles(nodefs_t *fs)
     nodefs_handle_t *handle, *next;
 
     list_for_each_entry_safe(handle, next, &fs->handles, link) {
-        if (handle->ph != NULL)
-            fuse_pollhandle_destroy(handle->ph);
+        nodefs_pollref_put(handle->pollref);
         list_del(&handle->link);
         free(handle);
     }
@@ -439,9 +590,13 @@ void nodefs_destroy(nodefs_t *fs)
     }
 
     pthread_rwlock_wrlock(&fs->lock);
+    fs->retiring = 1;
     nodefs_clear_handles(fs);
     nodefs_clear(fs);
     pthread_rwlock_unlock(&fs->lock);
+    nodefs_notifications_drain(fs);
+    pthread_cond_destroy(&fs->notify_idle);
+    pthread_mutex_destroy(&fs->notify_lock);
     pthread_rwlock_destroy(&fs->lock);
     free(fs);
 }
@@ -485,14 +640,19 @@ int nodefs_register(nodefs_t *fs, const nodefs_node_t *node)
     return ret;
 }
 
-int nodefs_unregister(nodefs_t *fs, const char *name)
+static int nodefs_unregister_impl(nodefs_t *fs, const char *name)
 {
     nodefs_entry_t *entry;
     nodefs_entry_t *parent;
     nodefs_entry_t *grandparent;
     char *path;
     int ret = 0;
+    nodefs_pollref_t **refs = NULL;
+    size_t count = 0;
+    nodefs_entry_t *removed = NULL;
 
+    if (nodefs_callback_depth)
+        return -EDEADLK;
     if (fs == NULL || !nodefs_valid_node_path(name)) {
         return -EINVAL;
     }
@@ -511,16 +671,18 @@ int nodefs_unregister(nodefs_t *fs, const char *name)
     } else {
         nodefs_handle_t *handle;
 
+        ret = nodefs_poll_snapshot(fs, entry, &refs, &count);
+        if (ret != 0)
+            goto out;
+
         list_for_each_entry(handle, &fs->handles, link) {
             if (handle->entry == entry) {
                 handle->entry = NULL;
-                if (handle->ph != NULL)
-                    fuse_notify_poll(handle->ph);
             }
         }
         parent = entry->parent;
         list_del(&entry->sibling);
-        nodefs_entry_destroy(entry);
+        removed = entry;
 
         while (parent != &fs->root && list_empty(&parent->children)) {
             grandparent = parent->parent;
@@ -529,20 +691,35 @@ int nodefs_unregister(nodefs_t *fs, const char *name)
             parent = grandparent;
         }
     }
+out:
     pthread_rwlock_unlock(&fs->lock);
 
     if (ret == 0) {
+        nodefs_poll_send(fs, refs, count);
         nodefs_invalidate_paths(fs, name);
+        nodefs_entry_drain(removed);
+        nodefs_entry_destroy(removed);
     }
 
     free(path);
     return ret;
 }
 
+int nodefs_unregister(nodefs_t *fs, const char *name)
+{
+    int cancel_state, ret;
+    /* Once detached, removal must finish draining and freeing the entry. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    ret = nodefs_unregister_impl(fs, name);
+    pthread_setcancelstate(cancel_state, NULL);
+    return ret;
+}
+
 int nodefs_notify_poll(nodefs_t *fs, const char *name)
 {
     nodefs_entry_t *entry;
-    nodefs_handle_t *handle;
+    nodefs_pollref_t **refs = NULL;
+    size_t count = 0;
     char *path;
     int ret = 0;
 
@@ -554,61 +731,78 @@ int nodefs_notify_poll(nodefs_t *fs, const char *name)
 
     pthread_rwlock_wrlock(&fs->lock);
     entry = nodefs_find_path(fs, path);
-    if (entry == NULL)
+    if (fs->retiring)
+        ret = -ESHUTDOWN;
+    else if (entry == NULL)
         ret = -ENOENT;
     else if (entry->type != NODEFS_ENTRY_FILE)
         ret = -EISDIR;
+    else
+        ret = nodefs_poll_snapshot(fs, entry, &refs, &count);
+    pthread_rwlock_unlock(&fs->lock);
+    if (ret == 0)
+        ret = nodefs_poll_send(fs, refs, count);
+    free(path);
+    return ret;
+}
+
+/* Acquiring an entry pin never keeps the filesystem lock across a callback. */
+static int nodefs_acquire_entry(nodefs_t *fs, const char *path,
+                                struct fuse_file_info *fi,
+                                nodefs_entry_t **result)
+{
+    nodefs_entry_t *entry;
+    int ret = 0;
+    pthread_rwlock_rdlock(&fs->lock);
+    if (fi != NULL && fi->fh != 0)
+        entry = ((nodefs_handle_t *)(uintptr_t)fi->fh)->entry;
+    else
+        entry = nodefs_find_path(fs, path);
+    if (entry == NULL)
+        ret = (fi != NULL && fi->fh != 0) ? -ENODEV : -ENOENT;
+    else if (entry->type != NODEFS_ENTRY_FILE)
+        ret = -EISDIR;
     else {
-        list_for_each_entry(handle, &fs->handles, link) {
-            if (handle->entry == entry && handle->ph != NULL) {
-                int err = fuse_notify_poll(handle->ph);
-                if (err != 0 && ret == 0)
-                    ret = err;
-            }
-        }
+        nodefs_entry_pin(entry);
+        *result = entry;
     }
     pthread_rwlock_unlock(&fs->lock);
-    free(path);
     return ret;
 }
 
 static int nodefs_getattr(const char *path, struct stat *stbuf,
                           struct fuse_file_info *fi)
 {
-    nodefs_mount_t *mount = (nodefs_mount_t*)nodefs_get_userdata();
+    nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_entry_t *entry;
     const nodefs_node_t *node;
-    int ret = 0;
-
     (void)fi;
     memset(stbuf, 0, sizeof(*stbuf));
-
-    if (mount == NULL || mount->fs == NULL) {
+    if (mount == NULL || mount->fs == NULL)
+        return -ENOENT;
+    pthread_rwlock_rdlock(&mount->fs->lock);
+    entry = nodefs_find_path(mount->fs, path);
+    if (entry == NULL) {
+        pthread_rwlock_unlock(&mount->fs->lock);
         return -ENOENT;
     }
-
-    pthread_rwlock_rdlock(&mount->fs->lock);
-    entry = (mount != NULL) ? nodefs_find_path(mount->fs, path) : NULL;
-    if (entry == NULL) {
-        ret = -ENOENT;
-        goto out;
-    }
-
     if (entry->type == NODEFS_ENTRY_DIR) {
         stbuf->st_mode = S_IFDIR | 0755;
         stbuf->st_nlink = 2;
-        goto out;
+        pthread_rwlock_unlock(&mount->fs->lock);
+        return 0;
     }
-
+    nodefs_entry_pin(entry);
+    pthread_rwlock_unlock(&mount->fs->lock);
     node = entry->node;
+    nodefs_callback_depth++;
+    pthread_cleanup_push(nodefs_callback_cleanup, entry);
     stbuf->st_mode = S_IFREG | node->mode;
     stbuf->st_nlink = 1;
     stbuf->st_size = (node->ops != NULL && node->ops->size != NULL) ?
         node->ops->size(node->user_data) : 0;
-
-out:
-    pthread_rwlock_unlock(&mount->fs->lock);
-    return ret;
+    pthread_cleanup_pop(1);
+    return 0;
 }
 
 static int nodefs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -712,8 +906,7 @@ static int nodefs_release(const char *path, struct fuse_file_info *fi)
     if (mount == NULL || mount->fs == NULL || handle == NULL)
         return 0;
     pthread_rwlock_wrlock(&mount->fs->lock);
-    if (handle->ph != NULL)
-        fuse_pollhandle_destroy(handle->ph);
+    nodefs_pollref_put(handle->pollref);
     list_del(&handle->link);
     free(handle);
     fi->fh = 0;
@@ -726,8 +919,9 @@ static int nodefs_poll(const char *path, struct fuse_file_info *fi,
 {
     nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_handle_t *handle = (nodefs_handle_t *)(uintptr_t)fi->fh;
+    nodefs_entry_t *entry;
+    nodefs_pollref_t *ref = NULL;
     const nodefs_node_t *node;
-
     (void)path;
     *reventsp = 0;
     if (mount == NULL || mount->fs == NULL || handle == NULL) {
@@ -735,134 +929,102 @@ static int nodefs_poll(const char *path, struct fuse_file_info *fi,
             fuse_pollhandle_destroy(ph);
         return -EBADF;
     }
-
-    pthread_rwlock_wrlock(&mount->fs->lock);
-    /* Register before querying readiness: a concurrent producer's notify
-     * waits for this lock, so a readiness transition cannot be lost. */
     if (ph != NULL) {
-        if (handle->ph != NULL)
-            fuse_pollhandle_destroy(handle->ph);
-        handle->ph = ph;
-    }
-    if (handle->entry == NULL) {
-        *reventsp = POLLHUP | POLLERR;
-    } else {
-        node = handle->entry->node;
-        if (node->ops->poll != NULL)
-            *reventsp = node->ops->poll(node->user_data);
-        else {
-            if (node->ops->read != NULL)
-                *reventsp |= POLLIN | POLLRDNORM;
-            if (node->ops->write != NULL)
-                *reventsp |= POLLOUT | POLLWRNORM;
+        ref = malloc(sizeof(*ref));
+        if (ref == NULL) {
+            fuse_pollhandle_destroy(ph);
+            return -ENOMEM;
         }
+        ref->ph = ph;
+        ref->refs = 1;
     }
+    pthread_rwlock_wrlock(&mount->fs->lock);
+    /* Publish the handle before querying readiness. A concurrent producer
+     * can notify it even while the readiness callback is still executing. */
+    if (ref != NULL) {
+        nodefs_pollref_put(handle->pollref);
+        handle->pollref = ref;
+    }
+    entry = handle->entry;
+    if (entry == NULL) {
+        *reventsp = POLLHUP | POLLERR;
+        pthread_rwlock_unlock(&mount->fs->lock);
+        return 0;
+    }
+    nodefs_entry_pin(entry);
     pthread_rwlock_unlock(&mount->fs->lock);
+    node = entry->node;
+    nodefs_callback_depth++;
+    pthread_cleanup_push(nodefs_callback_cleanup, entry);
+    if (node->ops->poll != NULL)
+        *reventsp = node->ops->poll(node->user_data);
+    else {
+        if (node->ops->read != NULL)
+            *reventsp |= POLLIN | POLLRDNORM;
+        if (node->ops->write != NULL)
+            *reventsp |= POLLOUT | POLLWRNORM;
+    }
+    pthread_cleanup_pop(1);
     return 0;
 }
 
 static int nodefs_read(const char *path, char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi)
 {
-    nodefs_mount_t *mount = (nodefs_mount_t*)nodefs_get_userdata();
+    nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_entry_t *entry;
     const nodefs_node_t *node;
     size_t node_size;
     int ret;
-
-    if (offset < 0) {
+    if (offset < 0)
         return -EINVAL;
-    }
-
-    if (mount == NULL || mount->fs == NULL) {
+    if (mount == NULL || mount->fs == NULL)
         return -ENOENT;
-    }
-
-    pthread_rwlock_rdlock(&mount->fs->lock);
-    if (fi->fh != 0 &&
-        ((nodefs_handle_t *)(uintptr_t)fi->fh)->entry == NULL) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -ENODEV;
-    }
-    entry = (mount != NULL) ? nodefs_find_path(mount->fs, path) : NULL;
-    if (entry == NULL) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -ENOENT;
-    }
-    if (entry->type != NODEFS_ENTRY_FILE) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -EISDIR;
-    }
-
+    ret = nodefs_acquire_entry(mount->fs, path, fi, &entry);
+    if (ret != 0)
+        return ret;
     node = entry->node;
+    nodefs_callback_depth++;
+    pthread_cleanup_push(nodefs_callback_cleanup, entry);
     if (node->ops == NULL || node->ops->read == NULL) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -EACCES;
-    }
-
-    if (size == 0) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return 0;
-    }
-
-    if (!(node->flags & NODEFS_NODE_STREAM) && node->ops->size != NULL) {
-        node_size = node->ops->size(node->user_data);
-        if ((uint64_t)offset >= node_size) {
-            pthread_rwlock_unlock(&mount->fs->lock);
-            return 0;
+        ret = -EACCES;
+    } else if (size == 0) {
+        ret = 0;
+    } else {
+        if (!(node->flags & NODEFS_NODE_STREAM) && node->ops->size != NULL) {
+            node_size = node->ops->size(node->user_data);
+            if ((uint64_t)offset >= node_size)
+                size = 0;
+            else if (size > node_size - (size_t)offset)
+                size = node_size - (size_t)offset;
         }
-        if (size > node_size - (size_t)offset) {
-            size = node_size - (size_t)offset;
-        }
+        ret = size == 0 ? 0 : node->ops->read(buf, size,
+            (node->flags & NODEFS_NODE_STREAM) ? 0 : offset, node->user_data);
     }
-
-    ret = node->ops->read(buf, size,
-                          (node->flags & NODEFS_NODE_STREAM) ? 0 : offset,
-                          node->user_data);
-    pthread_rwlock_unlock(&mount->fs->lock);
+    pthread_cleanup_pop(1);
     return ret;
 }
 
 static int nodefs_write(const char *path, const char *buf, size_t size,
                         off_t offset, struct fuse_file_info *fi)
 {
-    nodefs_mount_t *mount = (nodefs_mount_t*)nodefs_get_userdata();
+    nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_entry_t *entry;
     const nodefs_node_t *node;
     int ret;
-
-    if (offset < 0) {
+    if (offset < 0)
         return -EINVAL;
-    }
-
-    if (mount == NULL || mount->fs == NULL) {
+    if (mount == NULL || mount->fs == NULL)
         return -ENOENT;
-    }
-
-    pthread_rwlock_rdlock(&mount->fs->lock);
-    if (fi->fh != 0 &&
-        ((nodefs_handle_t *)(uintptr_t)fi->fh)->entry == NULL) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -ENODEV;
-    }
-    entry = (mount != NULL) ? nodefs_find_path(mount->fs, path) : NULL;
-    if (entry == NULL) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -ENOENT;
-    }
-    if (entry->type != NODEFS_ENTRY_FILE) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -EISDIR;
-    }
-
+    ret = nodefs_acquire_entry(mount->fs, path, fi, &entry);
+    if (ret != 0)
+        return ret;
     node = entry->node;
-    if (node->ops == NULL || node->ops->write == NULL) {
-        pthread_rwlock_unlock(&mount->fs->lock);
-        return -EACCES;
-    }
-
-    ret = node->ops->write(buf, size, offset, node->user_data);
-    pthread_rwlock_unlock(&mount->fs->lock);
+    nodefs_callback_depth++;
+    pthread_cleanup_push(nodefs_callback_cleanup, entry);
+    ret = (node->ops == NULL || node->ops->write == NULL) ? -EACCES :
+        node->ops->write(buf, size, offset, node->user_data);
+    pthread_cleanup_pop(1);
     return ret;
 }
 
@@ -882,6 +1044,7 @@ static void* nodefs_fuse_init(struct fuse_conn_info *conn,
     if (mount->fs != NULL) {
         pthread_rwlock_wrlock(&mount->fs->lock);
         mount->fs->fuse = ctx->fuse;
+        mount->fs->retiring = 0;
         pthread_rwlock_unlock(&mount->fs->lock);
     }
 
@@ -904,8 +1067,10 @@ static void nodefs_fuse_destroy(void *private_data)
 
     pthread_rwlock_wrlock(&mount->fs->lock);
     mount->fs->fuse = NULL;
+    mount->fs->retiring = 1;
     nodefs_clear_handles(mount->fs);
     pthread_rwlock_unlock(&mount->fs->lock);
+    nodefs_notifications_drain(mount->fs);
 }
 
 static const struct fuse_operations g_nodefs_oper = {

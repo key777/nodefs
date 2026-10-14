@@ -164,14 +164,25 @@ pthread_mutex_unlock(&q->lock);
 nodefs_notify_poll(fs, "rx");
 ```
 
-Callbacks run under the filesystem lock. They must not call registration,
-unregistration, or notification APIs, and must not wait for producers.
-Release any locks used by callbacks before invoking these APIs. Each open
+Callbacks run outside the filesystem lock with an active node reference.
+Callbacks may register nodes or publish notifications. Synchronous unregister
+from any node callback returns `-EDEADLK`, preventing a callback from waiting
+for itself or forming a cross-callback drain cycle. Unregister removes the
+path, detaches old descriptors, and waits for existing callbacks before
+returning; only then may caller-owned node definitions and state be freed.
+Cancellation during a callback releases its active reference.
+Release business locks before notifying. Each open
 instance has its own poll handle; closing and unmounting release the handles.
 Unregistering a node wakes existing watchers with `POLLHUP | POLLERR`; read
 and write callbacks through those descriptors return `-ENODEV`, even if the same path
 is registered again. Queue consumption semantics are shared between clients
 and defined by the node callback.
+
+Notifications snapshot references to FUSE poll handles before releasing the
+filesystem lock. Closing or replacing a handle cannot destroy it while a
+notification is using it. Unmount rejects new notifications and drains those
+already in progress before releasing the FUSE session. Stop all API callers
+and producers, and finish the FUSE loop, before calling `nodefs_destroy()`.
 
 Applications use `epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event)` with `EPOLLIN`,
 then read after `epoll_wait()`. With `EPOLLET`, drain the queue until `EAGAIN`.

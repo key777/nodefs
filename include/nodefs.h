@@ -40,12 +40,19 @@ typedef struct _nodefs_config {
 typedef struct nodefs nodefs_t;
 
 nodefs_t* nodefs_create(void);
+/* Stop the FUSE loop and all API callers/producers before destroying fs. */
 void nodefs_destroy(nodefs_t *fs);
 int nodefs_register(nodefs_t *fs, const nodefs_node_t *node);
+/* Detach the node and wait for active callbacks. On success, caller-owned
+ * node/ops/state may be freed even if old file descriptors remain open.
+ * Synchronous unregister from a node callback returns -EDEADLK.
+ * Thread cancellation is deferred until removal and drain finish. */
 int nodefs_unregister(nodefs_t *fs, const char *name);
 
-/* Publish readiness changes to all open instances. Call AFTER releasing any
- * locks used by callbacks. Notifications do not consume data. */
+/* Publish readiness changes to all open instances. Notification I/O and node
+ * callbacks run without the filesystem lock. Notifications do not consume
+ * data; release business locks before notifying to keep lock ordering simple.
+ * Returns -ESHUTDOWN once unmount starts. */
 int nodefs_notify_poll(nodefs_t *fs, const char *name);
 
 /*
