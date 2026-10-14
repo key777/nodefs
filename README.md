@@ -71,10 +71,12 @@ meson compile -C build-aarch64
 
 #include <string.h>
 
-static int speed_read(char *buf, size_t size, off_t offset)
+static int speed_read(char *buf, size_t size, off_t offset, void *user_data)
 {
     const char value[] = "1200\n";
     size_t len = sizeof(value) - 1;
+
+    (void)user_data;
 
     if ((size_t)offset >= len) {
         return 0;
@@ -87,8 +89,9 @@ static int speed_read(char *buf, size_t size, off_t offset)
     return size;
 }
 
-static size_t speed_size(void)
+static size_t speed_size(void *user_data)
 {
+    (void)user_data;
     return sizeof("1200\n") - 1;
 }
 
@@ -126,7 +129,60 @@ int main(void)
 }
 ```
 
-## Notes
+## poll / epoll
+
+Nodes may provide `nodefs_ops_t.poll`, returning a current `POLL*` readiness
+mask (for example `POLLIN` when a receive queue has data, or zero when empty).
+After updating the queue, call `nodefs_notify_poll(fs, "rx")` to wake all
+open instances watching that node. The public API uses `<poll.h>` constants
+and does not expose FUSE handles. Nodes without a poll callback retain
+always-ready behavior for their supported read/write operations.
+
+For a receive queue, set `.flags = NODEFS_NODE_STREAM` on the node. This
+disables file caching and seeking, skips the size callback during reads, and
+passes offset zero to the read callback. The callback should consume queued
+bytes, return `-EAGAIN` when empty, and return zero only when the stream ends
+(or for a zero-length request). Stream callbacks must return promptly;
+blocking stream reads are not implemented. Clients should open with
+`O_NONBLOCK` and wait with poll or epoll.
+
+```c
+static unsigned rx_poll(void *user_data)
+{
+    struct queue *q = user_data;
+    unsigned events;
+    pthread_mutex_lock(&q->lock);
+    events = q->count ? POLLIN : 0;
+    pthread_mutex_unlock(&q->lock);
+    return events;
+}
+
+/* Producer: publish data before notifying, and release the queue lock first. */
+pthread_mutex_lock(&q->lock);
+queue_push(q, data, len);
+pthread_mutex_unlock(&q->lock);
+nodefs_notify_poll(fs, "rx");
+```
+
+Callbacks run under the filesystem lock. They must not call registration,
+unregistration, or notification APIs, and must not wait for producers.
+Release any locks used by callbacks before invoking these APIs. Each open
+instance has its own poll handle; closing and unmounting release the handles.
+Unregistering a node wakes existing watchers with `POLLHUP | POLLERR`; read
+and write callbacks through those descriptors return `-ENODEV`, even if the same path
+is registered again. Queue consumption semantics are shared between clients
+and defined by the node callback.
+
+Applications use `epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event)` with `EPOLLIN`,
+then read after `epoll_wait()`. With `EPOLLET`, drain the queue until `EAGAIN`.
+epoll signals readiness; it does not perform the read or guarantee the callback
+can never return `EAGAIN` after another reader consumes the data.
+
+The header has new fields: rebuild applications using the static library.
+Initialize node and callback structs with designated initializers or zero
+initialization so unused optional fields remain zero.
+
+## Node lifecycle
 
 - Node names are relative paths, such as `can0/motor0/state/speed`.
 - Intermediate directories are created automatically.

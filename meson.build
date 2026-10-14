@@ -66,6 +66,14 @@ nodefs_smoke_test = executable(
 
 test('nodefs-smoke', nodefs_smoke_test)
 
+nodefs_poll_test = executable(
+  'nodefs_poll_test',
+  'test/poll_test.c',
+  dependencies: nodefs_fuse3_dep,
+  include_directories: nodefs_inc,
+)
+test('nodefs-poll', nodefs_poll_test)
+
 install_headers('include/nodefs.h')
 
 nodefs_python = import('python').find_installation()
