@@ -54,14 +54,14 @@ static struct fuse_pollhandle *new_pollhandle(void)
     return ph;
 }
 
-static unsigned queue_poll(void *data)
+static unsigned queue_poll(const nodefs_context_t *ctx)
 {
-    return *(unsigned *)data ? POLLIN : 0;
+    return *(unsigned *)nodefs_context_userdata(ctx) ? POLLIN : 0;
 }
 
-static int queue_read(char *buf, size_t size, off_t offset, void *data)
+static int queue_read(char *buf, size_t size, off_t offset, const nodefs_context_t *ctx)
 {
-    unsigned *count = data;
+    unsigned *count = nodefs_context_userdata(ctx);
     assert(offset == 0);
     if (size == 0)
         return 0;
@@ -72,9 +72,9 @@ static int queue_read(char *buf, size_t size, off_t offset, void *data)
     return 1;
 }
 
-static size_t zero_size(void *data)
+static size_t zero_size(const nodefs_context_t *ctx)
 {
-    (void)data;
+    (void)ctx;
     return 0;
 }
 
@@ -92,9 +92,9 @@ static void unlock_mutex(void *arg)
     pthread_mutex_unlock(arg);
 }
 
-static int slow_read(char *buf, size_t size, off_t offset, void *data)
+static int slow_read(char *buf, size_t size, off_t offset, const nodefs_context_t *ctx)
 {
-    struct blocked_read *state = data;
+    struct blocked_read *state = nodefs_context_userdata(ctx);
     (void)buf; (void)size; (void)offset;
     assert(nodefs_notify_poll(state->fs, "blocked") == 0);
     assert(nodefs_unregister(state->fs, "blocked") == -EDEADLK);
@@ -287,6 +287,96 @@ static void test_notify_unmount(void)
     nodefs_destroy(fs);
 }
 
+struct context_probe {
+    int flags, has_open, flags_available;
+    unsigned seen;
+};
+
+static struct context_probe *check_context(const nodefs_context_t *ctx)
+{
+    struct context_probe *probe = nodefs_context_userdata(ctx);
+    assert(probe != NULL);
+    assert(nodefs_context_has_open(ctx) == probe->has_open);
+    assert(nodefs_context_flags(ctx) == (probe->flags_available ? probe->flags : -ENODATA));
+    return probe;
+}
+
+static size_t probe_size(const nodefs_context_t *ctx)
+{
+    check_context(ctx)->seen |= 1u;
+    return 1;
+}
+
+static int probe_read(char *buf, size_t size, off_t offset,
+                       const nodefs_context_t *ctx)
+{
+    assert(size == 1 && offset == 0);
+    check_context(ctx)->seen |= 2u;
+    buf[0] = 'x';
+    return 1;
+}
+
+static int probe_write(const char *buf, size_t size, off_t offset,
+                        const nodefs_context_t *ctx)
+{
+    (void)buf; (void)offset;
+    check_context(ctx)->seen |= 4u;
+    return (int)size;
+}
+
+static unsigned probe_poll(const nodefs_context_t *ctx)
+{
+    check_context(ctx)->seen |= 8u;
+    return POLLIN;
+}
+
+static void test_context_api(void)
+{
+    struct context_probe probe = {0};
+    nodefs_t *fs = nodefs_create();
+    nodefs_mount_t mount = { .fs = fs };
+    nodefs_ops_t ops = {
+        .read = probe_read, .write = probe_write,
+        .size = probe_size, .poll = probe_poll,
+    };
+    nodefs_node_t node = {
+        .name = "probe", .mode = 0666, .ops = &ops, .user_data = &probe,
+    };
+    struct fuse_file_info fi = { .flags = O_RDWR | O_NONBLOCK };
+    struct fuse_file_info other = { .flags = O_RDONLY };
+    struct stat st;
+    char buf[4];
+    unsigned events;
+    test_context.private_data = &mount;
+    assert(nodefs_context_userdata(NULL) == NULL);
+    assert(nodefs_context_has_open(NULL) == 0);
+    assert(nodefs_context_flags(NULL) == -EINVAL);
+    assert(nodefs_register(fs, &node) == 0);
+    assert(nodefs_getattr("/probe", &st, NULL) == 0);
+    assert(st.st_size == 1);
+    assert(nodefs_open("/probe", &fi) == 0);
+    assert(nodefs_open("/probe", &other) == 0);
+    probe.has_open = 1;
+    probe.flags = fi.flags;
+    assert(nodefs_getattr("/probe", &st, &fi) == 0);
+    probe.flags_available = 1;
+    assert(nodefs_read("/probe", buf, sizeof(buf), 0, &fi) == 1);
+    assert(nodefs_write("/probe", "x", 1, 0, &fi) == 1);
+    probe.flags_available = 0;
+    assert(nodefs_poll("/probe", &fi, NULL, &events) == 0);
+    assert(probe.seen == 15u);
+    probe.flags_available = 1;
+    /* Use this operation's fi flags, not a copy saved at open. */
+    fi.flags = O_RDWR;
+    probe.flags = fi.flags;
+    assert(nodefs_read("/probe", buf, sizeof(buf), 0, &fi) == 1);
+    probe.flags = other.flags;
+    assert(nodefs_read("/probe", buf, sizeof(buf), 0, &other) == 1);
+    assert(nodefs_release("/probe", &fi) == 0);
+    assert(nodefs_release("/probe", &other) == 0);
+    nodefs_destroy(fs);
+}
+
 int main(void)
 {
     unsigned count = 0, events;
@@ -353,5 +443,6 @@ int main(void)
     test_callback_drain(1);
     test_notify_close();
     test_notify_unmount();
+    test_context_api();
     return 0;
 }

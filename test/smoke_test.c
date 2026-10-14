@@ -5,12 +5,12 @@
 #include <stdio.h>
 #include <string.h>
 
-static int value_read(char *buf, size_t size, off_t offset, void *user_data)
+static int value_read(char *buf, size_t size, off_t offset, const nodefs_context_t *ctx)
 {
     const char value[] = "42\n";
     size_t len = sizeof(value) - 1;
 
-    (void)user_data;
+    (void)ctx;
 
     if (offset < 0) {
         return -EINVAL;
@@ -26,9 +26,9 @@ static int value_read(char *buf, size_t size, off_t offset, void *user_data)
     return (int)size;
 }
 
-static size_t value_size(void *user_data)
+static size_t value_size(const nodefs_context_t *ctx)
 {
-    (void)user_data;
+    (void)ctx;
     return sizeof("42\n") - 1;
 }
 

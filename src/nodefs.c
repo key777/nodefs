@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse3/fuse.h>
+#include <fuse3/fuse_lowlevel.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -63,6 +64,53 @@ typedef struct _nodefs_mount_t {
 } nodefs_mount_t;
 
 static _Thread_local unsigned nodefs_callback_depth;
+
+struct nodefs_context {
+    void *user_data;
+    int flags;
+    int has_open;
+    int has_flags;
+    struct fuse *fuse;
+};
+
+void *nodefs_context_userdata(const nodefs_context_t *ctx)
+{
+    return ctx != NULL ? ctx->user_data : NULL;
+}
+
+int nodefs_context_has_open(const nodefs_context_t *ctx)
+{
+    return ctx != NULL && ctx->has_open;
+}
+
+int nodefs_context_flags(const nodefs_context_t *ctx)
+{
+    if (ctx == NULL)
+        return -EINVAL;
+    return ctx->has_flags ? ctx->flags : -ENODATA;
+}
+
+int nodefs_context_interrupted(const nodefs_context_t *ctx)
+{
+    if (ctx == NULL || ctx->fuse == NULL)
+        return 0;
+    return fuse_interrupted() || fuse_session_exited(fuse_get_session(ctx->fuse));
+}
+
+static nodefs_context_t nodefs_make_context(nodefs_entry_t *entry,
+                                           const struct fuse_file_info *fi,
+                                           int flags_available)
+{
+    struct fuse_context *fuse_ctx = fuse_get_context();
+    nodefs_context_t ctx = {
+        .user_data = entry->node->user_data,
+        .flags = fi != NULL ? fi->flags : 0,
+        .has_open = fi != NULL,
+        .has_flags = fi != NULL && flags_available,
+        .fuse = fuse_ctx != NULL ? fuse_ctx->fuse : NULL,
+    };
+    return ctx;
+}
 
 /* Pin while holding fs->lock; unregister detaches first, then drains pins. */
 static void nodefs_entry_pin(nodefs_entry_t *entry)
@@ -776,7 +824,7 @@ static int nodefs_getattr(const char *path, struct stat *stbuf,
     nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_entry_t *entry;
     const nodefs_node_t *node;
-    (void)fi;
+    nodefs_context_t ctx;
     memset(stbuf, 0, sizeof(*stbuf));
     if (mount == NULL || mount->fs == NULL)
         return -ENOENT;
@@ -795,12 +843,13 @@ static int nodefs_getattr(const char *path, struct stat *stbuf,
     nodefs_entry_pin(entry);
     pthread_rwlock_unlock(&mount->fs->lock);
     node = entry->node;
+    ctx = nodefs_make_context(entry, fi, 0);
     nodefs_callback_depth++;
     pthread_cleanup_push(nodefs_callback_cleanup, entry);
     stbuf->st_mode = S_IFREG | node->mode;
     stbuf->st_nlink = 1;
     stbuf->st_size = (node->ops != NULL && node->ops->size != NULL) ?
-        node->ops->size(node->user_data) : 0;
+        node->ops->size(&ctx) : 0;
     pthread_cleanup_pop(1);
     return 0;
 }
@@ -922,6 +971,7 @@ static int nodefs_poll(const char *path, struct fuse_file_info *fi,
     nodefs_entry_t *entry;
     nodefs_pollref_t *ref = NULL;
     const nodefs_node_t *node;
+    nodefs_context_t ctx;
     (void)path;
     *reventsp = 0;
     if (mount == NULL || mount->fs == NULL || handle == NULL) {
@@ -954,10 +1004,11 @@ static int nodefs_poll(const char *path, struct fuse_file_info *fi,
     nodefs_entry_pin(entry);
     pthread_rwlock_unlock(&mount->fs->lock);
     node = entry->node;
+    ctx = nodefs_make_context(entry, fi, 0);
     nodefs_callback_depth++;
     pthread_cleanup_push(nodefs_callback_cleanup, entry);
     if (node->ops->poll != NULL)
-        *reventsp = node->ops->poll(node->user_data);
+        *reventsp = node->ops->poll(&ctx);
     else {
         if (node->ops->read != NULL)
             *reventsp |= POLLIN | POLLRDNORM;
@@ -974,6 +1025,7 @@ static int nodefs_read(const char *path, char *buf, size_t size, off_t offset,
     nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_entry_t *entry;
     const nodefs_node_t *node;
+    nodefs_context_t ctx;
     size_t node_size;
     int ret;
     if (offset < 0)
@@ -984,6 +1036,7 @@ static int nodefs_read(const char *path, char *buf, size_t size, off_t offset,
     if (ret != 0)
         return ret;
     node = entry->node;
+    ctx = nodefs_make_context(entry, fi, 1);
     nodefs_callback_depth++;
     pthread_cleanup_push(nodefs_callback_cleanup, entry);
     if (node->ops == NULL || node->ops->read == NULL) {
@@ -991,15 +1044,16 @@ static int nodefs_read(const char *path, char *buf, size_t size, off_t offset,
     } else if (size == 0) {
         ret = 0;
     } else {
+        size_t count = size;
         if (!(node->flags & NODEFS_NODE_STREAM) && node->ops->size != NULL) {
-            node_size = node->ops->size(node->user_data);
+            node_size = node->ops->size(&ctx);
             if ((uint64_t)offset >= node_size)
-                size = 0;
-            else if (size > node_size - (size_t)offset)
-                size = node_size - (size_t)offset;
+                count = 0;
+            else if (count > node_size - (size_t)offset)
+                count = node_size - (size_t)offset;
         }
-        ret = size == 0 ? 0 : node->ops->read(buf, size,
-            (node->flags & NODEFS_NODE_STREAM) ? 0 : offset, node->user_data);
+        ret = count == 0 ? 0 : node->ops->read(buf, count,
+            (node->flags & NODEFS_NODE_STREAM) ? 0 : offset, &ctx);
     }
     pthread_cleanup_pop(1);
     return ret;
@@ -1011,6 +1065,7 @@ static int nodefs_write(const char *path, const char *buf, size_t size,
     nodefs_mount_t *mount = nodefs_get_userdata();
     nodefs_entry_t *entry;
     const nodefs_node_t *node;
+    nodefs_context_t ctx;
     int ret;
     if (offset < 0)
         return -EINVAL;
@@ -1020,10 +1075,11 @@ static int nodefs_write(const char *path, const char *buf, size_t size,
     if (ret != 0)
         return ret;
     node = entry->node;
+    ctx = nodefs_make_context(entry, fi, 1);
     nodefs_callback_depth++;
     pthread_cleanup_push(nodefs_callback_cleanup, entry);
     ret = (node->ops == NULL || node->ops->write == NULL) ? -EACCES :
-        node->ops->write(buf, size, offset, node->user_data);
+        node->ops->write(buf, size, offset, &ctx);
     pthread_cleanup_pop(1);
     return ret;
 }

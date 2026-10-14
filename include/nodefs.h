@@ -10,16 +10,32 @@ extern "C" {
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* Per-operation context, borrowed only for the duration of a callback.
+ * Do not retain or free it. The node's user_data remains caller-owned. */
+typedef struct nodefs_context nodefs_context_t;
+void *nodefs_context_userdata(const nodefs_context_t *ctx);
+/* Whether this operation has an open-file context; flags may still be absent. */
+int nodefs_context_has_open(const nodefs_context_t *ctx);
+/* Current read/write flags, or -ENODATA if this operation supplies no flags
+ * (e.g. poll/getattr). -EINVAL for NULL; O_RDONLY (zero) is a valid result.
+ * size called from read shares its flags, unlike size called from getattr. */
+int nodefs_context_flags(const nodefs_context_t *ctx);
+/* True if the current FUSE request was interrupted or the session is exiting.
+ * Query on the callback thread; useful for bounded waits in blocking reads. */
+int nodefs_context_interrupted(const nodefs_context_t *ctx);
+
 typedef struct _nodefs_ops {
-    int (*read)(char *buf, size_t size, off_t offset, void *user_data);
-    int (*write)(const char *buf, size_t size, off_t offset, void *user_data);
-    size_t (*size)(void *user_data);
+    int (*read)(char *buf, size_t size, off_t offset, const nodefs_context_t *ctx);
+    int (*write)(const char *buf, size_t size, off_t offset, const nodefs_context_t *ctx);
+    size_t (*size)(const nodefs_context_t *ctx);
     /* Current POLL* readiness mask; must not block. NULL means always ready. */
-    unsigned (*poll)(void *user_data);
+    unsigned (*poll)(const nodefs_context_t *ctx);
 } nodefs_ops_t;
 
 /* Queue-style reads: ignore offset/size, bypass cache, no seeking.
- * read must not block: return -EAGAIN while empty, 0 only at end of stream. */
+ * With O_NONBLOCK, return -EAGAIN while empty; otherwise the callback may wait.
+ * Return 0 only at end of stream or for a zero-length request. A blocking
+ * callback must be woken during shutdown before node unregistration drains. */
 #define NODEFS_NODE_STREAM (1u << 0)
 
 typedef struct _nodefs_node {

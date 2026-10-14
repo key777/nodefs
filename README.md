@@ -71,12 +71,12 @@ meson compile -C build-aarch64
 
 #include <string.h>
 
-static int speed_read(char *buf, size_t size, off_t offset, void *user_data)
+static int speed_read(char *buf, size_t size, off_t offset, const nodefs_context_t *ctx)
 {
     const char value[] = "1200\n";
     size_t len = sizeof(value) - 1;
 
-    (void)user_data;
+    (void)ctx;
 
     if ((size_t)offset >= len) {
         return 0;
@@ -89,9 +89,9 @@ static int speed_read(char *buf, size_t size, off_t offset, void *user_data)
     return size;
 }
 
-static size_t speed_size(void *user_data)
+static size_t speed_size(const nodefs_context_t *ctx)
 {
-    (void)user_data;
+    (void)ctx;
     return sizeof("1200\n") - 1;
 }
 
@@ -129,6 +129,44 @@ int main(void)
 }
 ```
 
+## Callback context
+
+All node callbacks receive `const nodefs_context_t *ctx` instead of a raw
+`void *user_data`. Its layout is private. The context is constructed for each
+operation and is valid only until that callback returns; do not save or free
+its pointer. The node still stores a caller-owned `user_data` pointer.
+
+- `nodefs_context_userdata(ctx)` returns that business pointer.
+- `nodefs_context_has_open(ctx)` tells whether open information is available.
+- `nodefs_context_flags(ctx)` returns this operation's open flags, or
+  `-ENODATA` when this operation carries no flags (`-EINVAL` for NULL).
+  `O_RDONLY`, whose value is zero, is valid. Flags come from the current FUSE
+  operation rather than a saved copy from open.
+- `nodefs_context_interrupted(ctx)` checks request interruption/session exit
+  on the callback thread, allowing blocking callbacks to stop bounded waits.
+
+Read, write and poll receive open information. A path-only getattr/size query
+may have none. FUSE poll/getattr requests do not supply open flags, so
+flags queries return `-ENODATA` even when an open context exists. Size queries
+invoked from read receive the read's context, including its current flags.
+
+This changes callback signatures and ABI. Migrate every node implementation
+and rebuild applications with the matching header and library. For example:
+
+```c
+static int rx_read(char *buf, size_t size, off_t offset,
+                   const nodefs_context_t *ctx)
+{
+    struct queue *q = nodefs_context_userdata(ctx);
+    int flags = nodefs_context_flags(ctx);
+    if (flags < 0)
+        return flags;
+    /* Consume q; return -EAGAIN if empty and flags & O_NONBLOCK.
+     * Otherwise wait, checking interruption and the queue's close state. */
+    return queue_read(q, buf, size, offset, flags);
+}
+```
+
 ## poll / epoll
 
 Nodes may provide `nodefs_ops_t.poll`, returning a current `POLL*` readiness
@@ -141,15 +179,18 @@ always-ready behavior for their supported read/write operations.
 For a receive queue, set `.flags = NODEFS_NODE_STREAM` on the node. This
 disables file caching and seeking, skips the size callback during reads, and
 passes offset zero to the read callback. The callback should consume queued
-bytes, return `-EAGAIN` when empty, and return zero only when the stream ends
-(or for a zero-length request). Stream callbacks must return promptly;
-blocking stream reads are not implemented. Clients should open with
-`O_NONBLOCK` and wait with poll or epoll.
+bytes and return zero only when the stream ends (or for a zero-length request).
+Stream read callbacks distinguish blocking and nonblocking opens using
+`nodefs_context_flags(ctx)`. With `O_NONBLOCK`, return promptly and use poll
+or epoll to wait; without it, the callback may wait for a sample. Wake blocked
+callbacks before unregistering their node. For FUSE request interruption or
+unmount, bounded waits may query `nodefs_context_interrupted(ctx)` and return
+`-EINTR`. Poll callbacks themselves must never wait for data.
 
 ```c
-static unsigned rx_poll(void *user_data)
+static unsigned rx_poll(const nodefs_context_t *ctx)
 {
-    struct queue *q = user_data;
+    struct queue *q = nodefs_context_userdata(ctx);
     unsigned events;
     pthread_mutex_lock(&q->lock);
     events = q->count ? POLLIN : 0;
